@@ -1,0 +1,228 @@
+# ChatApp v1 — Protocol Specification
+
+**Version:** 1.0  
+**Status:** Draft — requires sign-off from both teammates before implementation  
+**Last Updated:** 2026-03-18
+
+---
+
+## 1. Overview
+
+This document defines the complete communication protocol between the ChatApp client and server. Both the UI/Client module and the Server module are bound by this specification. Neither side may deviate from it without a mutual revision and re-sign-off.
+
+**Transport:** TCP  
+**Encoding:** UTF-8 JSON  
+**Framing:** Newline-terminated — every message ends with a single `\n` character. The newline is the message boundary. There are no other delimiters.
+
+Qt implementation note: Use `QTcpSocket::readLine()` on the receiver side and append `\n` to every outgoing message before writing to the socket.
+
+---
+
+## 2. General Message Structure
+
+Every message — in both directions — is a single-line JSON object with the following top-level fields:
+
+```json
+{
+  "type":      "<message type>",
+  "timestamp": "<ISO 8601 UTC string>",
+  "payload":   { ... }
+}
+```
+
+| Field       | Type   | Required | Description                                        |
+|-------------|--------|----------|----------------------------------------------------|
+| `type`      | string | Yes      | One of: `CONNECT`, `DISCONNECT`, `MESSAGE`         |
+| `timestamp` | string | Yes      | UTC time of sending, format: `"2026-03-18T10:30:00Z"` |
+| `payload`   | object | Yes      | Type-specific fields (defined per type below)      |
+
+Rules:
+- Unknown fields at the top level must be ignored, not rejected.
+- Missing required fields should result in an `ERROR` response from the server (see Section 6).
+- The entire JSON object, including the closing `}`, must fit on one line — no embedded newlines in any string value.
+
+---
+
+## 3. Message Types (Client → Server)
+
+### 3.1 CONNECT
+
+Sent by the client immediately after establishing a TCP connection. Must be the first message sent. The server will not process any other message type until a valid CONNECT has been received from that socket.
+
+```json
+{
+  "type": "CONNECT",
+  "timestamp": "2026-03-18T10:30:00Z",
+  "payload": {
+    "username": "alice"
+  }
+}
+```
+
+| Payload Field | Type   | Required | Constraints                              |
+|---------------|--------|----------|------------------------------------------|
+| `username`    | string | Yes      | 1–20 characters, alphanumeric + underscores only, case-sensitive |
+
+Server behaviour on receipt:
+- If the username is already taken by an active connection → respond with `ERROR`, close the socket.
+- If the username is valid and available → accept the connection, broadcast a system `MESSAGE` to all other clients (e.g. "alice has joined").
+
+---
+
+### 3.2 MESSAGE
+
+Sent by the client to deliver a chat message. Only valid after a successful `CONNECT`.
+
+```json
+{
+  "type": "MESSAGE",
+  "timestamp": "2026-03-18T10:31:05Z",
+  "payload": {
+    "text": "Hello everyone!"
+  }
+}
+```
+
+| Payload Field | Type   | Required | Constraints                        |
+|---------------|--------|----------|------------------------------------|
+| `text`        | string | Yes      | 1–500 characters, no embedded `\n` |
+
+Server behaviour on receipt:
+- Validate `text` is non-empty and within length limit.
+- Stamp with sender's username (the server knows this from the CONNECT step — the client does not send it again).
+- Broadcast the message to all connected clients including the sender (see Section 4.1).
+
+---
+
+### 3.3 DISCONNECT
+
+Sent by the client before closing the TCP connection cleanly. Optional but preferred — the server must also handle ungraceful disconnects (socket drop without DISCONNECT).
+
+```json
+{
+  "type": "DISCONNECT",
+  "timestamp": "2026-03-18T10:45:00Z",
+  "payload": {}
+}
+```
+
+No payload fields required.
+
+Server behaviour on receipt:
+- Remove the client from the active connection list.
+- Broadcast a system `MESSAGE` to remaining clients (e.g. "alice has left").
+- Close the socket.
+
+---
+
+## 4. Message Types (Server → Client)
+
+### 4.1 MESSAGE (Server broadcast)
+
+The server uses the same `MESSAGE` type to deliver messages to clients. The payload is extended with sender metadata that the client did not originally send.
+
+```json
+{
+  "type": "MESSAGE",
+  "timestamp": "2026-03-18T10:31:05Z",
+  "payload": {
+    "sender": "alice",
+    "text": "Hello everyone!",
+    "system": false
+  }
+}
+```
+
+| Payload Field | Type    | Description                                                                 |
+|---------------|---------|-----------------------------------------------------------------------------|
+| `sender`      | string  | Username of the sender. Set to `"__server__"` for system messages.         |
+| `text`        | string  | Message content.                                                            |
+| `system`      | boolean | `true` for join/leave announcements generated by the server, `false` for user messages. |
+
+The client UI must render `system: true` messages differently (e.g. greyed-out, centred, no avatar).
+
+---
+
+## 5. Error Handling
+
+The server sends an `ERROR` message when a client violates the protocol. After sending an `ERROR`, the server closes the socket.
+
+```json
+{
+  "type": "ERROR",
+  "timestamp": "2026-03-18T10:30:01Z",
+  "payload": {
+    "code": "USERNAME_TAKEN",
+    "message": "The username 'alice' is already in use."
+  }
+}
+```
+
+### Defined Error Codes
+
+| Code                | Trigger                                                  |
+|---------------------|----------------------------------------------------------|
+| `USERNAME_TAKEN`    | CONNECT received with an already-active username         |
+| `USERNAME_INVALID`  | Username fails length or character constraints           |
+| `NOT_CONNECTED`     | Non-CONNECT message received before a valid CONNECT      |
+| `MESSAGE_TOO_LONG`  | `text` field exceeds 500 characters                      |
+| `MALFORMED_JSON`    | Received data is not valid JSON or missing required fields |
+
+The client UI must display `ERROR` messages to the user and handle the subsequent socket close gracefully (not crash).
+
+---
+
+## 6. Connection Lifecycle
+
+```
+Client                          Server
+  |                               |
+  |--- TCP connect() ------------>|
+  |--- CONNECT (username) ------->|
+  |<-- MESSAGE (system: join) ----|  (broadcast to others)
+  |                               |
+  |--- MESSAGE (text) ----------->|
+  |<-- MESSAGE (broadcast) -------|  (sent to all clients)
+  |                               |
+  |--- DISCONNECT --------------->|
+  |<-- [socket closed] -----------|
+```
+
+Edge case: if the TCP connection drops without a DISCONNECT message, the server must detect this via socket error/close signal and perform the same cleanup (remove from active list, broadcast system leave message).
+
+---
+
+## 7. What Is Explicitly Out of Scope for v1
+
+The following will not be implemented and are not covered by this protocol:
+
+- Authentication / passwords
+- Private (direct) messages
+- Group/room support (there is one global room)
+- Message history / persistence
+- File or image transfer
+- Encryption (TLS or otherwise)
+- Message editing or deletion
+- Typing indicators or read receipts
+
+These may be defined in a future protocol version. Do not design the v1 code in anticipation of them — keep it simple.
+
+---
+
+## 8. Versioning
+
+This is protocol **v1.0**. Any change to message structure, field names, constraints, or behaviour requires:
+1. A PR updating this file.
+2. Review and approval from both teammates before merging.
+3. A version bump (1.0 → 1.1 for backwards-compatible changes, 2.0 for breaking changes).
+
+---
+
+## 9. Sign-off
+
+Both teammates must agree to this document before writing any networking or UI code.
+
+| Role              | Name | Agreement | Date |
+|-------------------|------|-----------|------|
+| UI / Client owner |      |           |      |
+| Server owner      |      |           |      |
